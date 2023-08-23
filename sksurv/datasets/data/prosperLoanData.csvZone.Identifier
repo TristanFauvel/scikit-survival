@@ -1,0 +1,4 @@
+[ZoneTransfer]
+ZoneId=3
+ReferrerUrl=https://bookdown.org/
+HostUrl=https://s3.amazonaws.com/udacity-hosted-downloads/ud651/prosperLoanData.csv

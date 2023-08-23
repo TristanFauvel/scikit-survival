@@ -2,8 +2,25 @@ from .util import check_y_survival
 import numpy as np
 import pandas as pd
 from .nonparametric import SurvivalFunctionEstimator
-from scipy.stats import chi2
-from .nonparametric import var_kaplan_meier_estimator
+from scipy.stats import chi2 
+import warnings
+import numbers
+from scipy import stats
+
+def variance_kaplan_meier_prob_survival(survival_prob, ci, conf_type="greenwood", conf_level=0.95):
+    """Variance of the Kaplan-Meier estimator of survival function. Computed using Greenwood's approximation
+    """
+    if conf_type not in {"greenwood"}:
+        raise ValueError(f"conf_type must be None or a str among {{'greenwood'}}, but was {conf_type!r}")
+
+    if not isinstance(conf_level, numbers.Real) or not np.isfinite(conf_level) or conf_level <= 0 or conf_level >= 1.0:
+        raise ValueError(f"conf_level must be a float in the range (0.0, 1.0), but was {conf_level!r}")
+
+    z = stats.norm.isf((1.0 - conf_level) / 2.0)
+    var_survival_prob =    ((ci[1,:] - survival_prob)/z)**2
+    return var_survival_prob
+
+
 
 def cook_ridker_test(model, X, y, time=3 / 4, Q=10):
     """Cook-Ridker goodness-of-fit test
@@ -55,8 +72,7 @@ def dagostino_nam_test(model, X, y, time=3 / 4, Q=10):
     """D'Agostino-Nam goodness-of-fit test
 
     The D'Agostino-Nam test is a translation of the Hosmer-Lemeshow goodness-of-fit test to survival analysis.
-    It is the same as the Cook-Ridker test, the difference being that the number of degrees of freedom
-    is Q-1 for the D'Agostino-Nam test.
+    It is the same as the Cook-Ridker test, the difference being that the number of degrees of freedom is Q-1 for the D'Agostino-Nam test.
 
     See [1]_ and [2]_ for further description.
 
@@ -101,8 +117,7 @@ def dagostino_nam_test(model, X, y, time=3 / 4, Q=10):
 def greenwood_dagostino_nam_test(model, X, y, time=3 / 4, Q=10):
     """Greenwood-D'Agostino-Nam test
 
-    The Greenwood-D'Agostino-Nam test is an improvement over the D'Agostino-Nam test with lower Type 1
-    error at higher censoring rates.
+    The Greenwood-D'Agostino-Nam test is an improvement over the D'Agostino-Nam test with lower Type 1 error at higher censoring rates.
 
     Parameters
     ----------
@@ -146,16 +161,11 @@ def _check_hl_test_inputs(model, df, time, Q, test):
     if Q < 1:
         raise ValueError("Number of groups must be at least 1.")
     if test not in ["CR", "DN", "GDN"]:
-        raise ValueError(
-            "The test name should be either ''CR'', ''DN'', or ''GDN''")
+        raise ValueError("The test name should be either ''CR'', ''DN'', or ''GDN''")
     if time > 1 or time <= 0:
         raise ValueError("Time must be between 0 and 1.")
     if not hasattr(model, "predict_survival_function"):
-        raise AttributeError(
-            "{!r} object has no attribute {!r}".format(
-                model, "predict_survival_function"
-            )
-        )
+        raise AttributeError("{!r} object has no attribute {!r}".format(model, "predict_survival_function"))
 
 
 def _hosmer_lemeshow_survival(model, X, y, df, time, Q, test):
@@ -210,6 +220,7 @@ def _hosmer_lemeshow_survival(model, X, y, df, time, Q, test):
     predictions = model.predict_survival_function(X)
     pred_surv_prob = np.row_stack([fn(time) for fn in predictions])
 
+    # Split the data into Q groups based on the risk scores (for example into deciles).
     group_data = True
     min_group_size = 5
     while group_data:
@@ -221,6 +232,7 @@ def _hosmer_lemeshow_survival(model, X, y, df, time, Q, test):
             duplicates="drop",
         )
         if any(np.array([sum(categories == i) for i in range(Q)]) < min_group_size):
+            warnings.warn("Some group sizes are less than 5, lowering the number of groups", UserWarning)
             Q = Q - 1
         else:
             group_data = False
@@ -233,23 +245,25 @@ def _hosmer_lemeshow_survival(model, X, y, df, time, Q, test):
     prob = np.zeros(Q)
     N = np.zeros(Q)
     KM = np.zeros(Q)
-    ci_KM = np.zeros((2,Q))
+    ci_KM = np.zeros((2, Q))
     for i in range(Q):
-        surv = SurvivalFunctionEstimator(conf_level=0.95, conf_type='log-log')
+        surv = SurvivalFunctionEstimator(conf_level=0.95, conf_type="greenwood")
         surv.fit(y[categories == i])
 
         max_t_i = event_time[categories == i].max()
+        # 1 - KM is the Kaplan-Meyer failure probabiliy in the g-th Q-quantile at time time
         if time > max_t_i:
-            KM[i], ci_temp = surv.predict_proba([max_t_i], return_conf_int = True)
+            KM[i], ci_temp = surv.predict_proba([max_t_i], return_conf_int=True)
         else:
-            KM[i], ci_temp = surv.predict_proba([time], return_conf_int = True)
-        ci_KM[:,i] = ci_temp.flatten()
+            KM[i], ci_temp = surv.predict_proba([time], return_conf_int=True)
+        ci_KM[:, i] = ci_temp.flatten()
 
         N[i] = np.sum(categories == i)
+
+        # Compute the mean predicted probability of failure for subjects ion the g-th Q-quantile.
         prob[i] = (1 - pred_surv_prob[categories == i]).sum(axis=0) / N[i]
 
-    Var_KM = var_kaplan_meier_estimator(KM, ci_KM)
-
+    # Determine how well the model fits the data in each decile, using Chi-squared statistics
     if test in ["CR", "DN"]:
         chisq_value = np.sum(
             np.divide(
@@ -261,6 +275,9 @@ def _hosmer_lemeshow_survival(model, X, y, df, time, Q, test):
             axis=0,
         )
     elif test == "GDN":
+        # Variance of the Kaplan-Meier estimator of the survival function
+        Var_KM = variance_kaplan_meier_prob_survival(KM, ci_KM, conf_level=0.95, conf_type = "greenwood") 
+
         chisq_value = np.sum(
             np.divide(
                 (1 - KM - prob) ** 2,
@@ -271,9 +288,10 @@ def _hosmer_lemeshow_survival(model, X, y, df, time, Q, test):
             axis=0,
         )
 
-    obsevents = N * (1 - KM)
-    expevents = N * prob
+    obsevents = N * (1 - KM)  # "Observed" number of failures (based on the Kaplan-Meier estimator)
+    expevents = N * prob  # Predicted number of failures
 
+    # Summarize informations for each group.
     groupings = pd.DataFrame(
         {
             "Groups": np.arange(Q),
@@ -296,4 +314,5 @@ def _hosmer_lemeshow_survival(model, X, y, df, time, Q, test):
         "p_value": pvalue,
         "groupings": groupings,
     }
+
     return test_result
